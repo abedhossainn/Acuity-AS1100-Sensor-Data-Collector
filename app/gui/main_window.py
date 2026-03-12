@@ -8,9 +8,9 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QPushButton, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QStatusBar, QGroupBox, QFormLayout,
-    QTextEdit, QMessageBox, QProgressBar, QAbstractItemView,
+    QTextEdit, QMessageBox, QProgressBar, QAbstractItemView, QHeaderView,
 )
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QSettings
 
 from app.domain.models import (
     MeasurementMode, IntervalMode, Unit, CollectionConfig
@@ -42,12 +42,16 @@ class MainWindow(QMainWindow):
         # State
         self.worker: Optional[AcquisitionWorker] = None
         self.csv_exporter: Optional[CSVExporter] = None
+        self.connected_client: Optional[AcuitySensorClient] = None
+        self.laser_was_connected_before_collection = False
         self.sample_count = 0
+        self.settings = QSettings("Acuity", "AS1100 Sensor Data Collector")
         self.output_folder = Path.home() / "sensor_data"
         
         # Create UI
         self._create_ui()
         self._refresh_ports()
+        self._load_settings()
         self._on_mode_changed()  # Initialize UI state based on default mode
     
     def _create_ui(self) -> None:
@@ -95,6 +99,27 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(conn_group)
         
+        # Laser control section
+        laser_group = QGroupBox("Laser Control")
+        laser_layout = QHBoxLayout(laser_group)
+        
+        self.laser_on_btn = QPushButton("Laser ON")
+        self.laser_on_btn.setStyleSheet("background-color: #FFD700; font-weight: bold;")
+        self.laser_on_btn.setEnabled(False)
+        self.laser_on_btn.clicked.connect(self._on_laser_on)
+        laser_layout.addWidget(self.laser_on_btn)
+        
+        self.laser_off_btn = QPushButton("Laser OFF")
+        self.laser_off_btn.setStyleSheet("background-color: #A9A9A9; font-weight: bold;")
+        self.laser_off_btn.setEnabled(False)
+        self.laser_off_btn.clicked.connect(self._on_laser_off)
+        laser_layout.addWidget(self.laser_off_btn)
+        
+        self.laser_distance_label = QLabel("Distance: -")
+        laser_layout.addWidget(self.laser_distance_label)
+        
+        layout.addWidget(laser_group)
+        
         # Measurement settings
         meas_group = QGroupBox("Measurement Settings")
         meas_layout = QFormLayout(meas_group)
@@ -118,6 +143,13 @@ class MainWindow(QMainWindow):
             self.unit_combo.addItem(unit.value, unit)
         self.unit_combo.setCurrentIndex(0)  # Default mm
         meas_layout.addRow("Unit:", self.unit_combo)
+        
+        # Decimal places selector
+        self.decimal_spinbox = QSpinBox()
+        self.decimal_spinbox.setMinimum(1)
+        self.decimal_spinbox.setMaximum(10)
+        self.decimal_spinbox.setValue(4)
+        meas_layout.addRow("Decimal Places:", self.decimal_spinbox)
         
         layout.addWidget(meas_group)
         
@@ -188,6 +220,8 @@ class MainWindow(QMainWindow):
         ])
         self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.data_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Make columns auto-adjust to available width
+        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.data_table)
         
         # Status log
@@ -204,9 +238,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.count_label)
         
         # Export button
-        export_btn = QPushButton("Open CSV File")
-        export_btn.clicked.connect(self._on_open_csv)
-        layout.addWidget(export_btn)
+        self.open_folder_btn = QPushButton("Open Output Folder")
+        self.open_folder_btn.clicked.connect(self._on_open_output_folder)
+        layout.addWidget(self.open_folder_btn)
         
         return panel
     
@@ -248,17 +282,23 @@ class MainWindow(QMainWindow):
             self.stop_btn.setVisible(False)
             # Show single button
             self.collect_btn.setVisible(True)
+
+        self._save_settings()
     
     @Slot()
     def _on_collect_single(self) -> None:
         """Handle single measurement collection."""
-        port = self.port_combo.currentText()
-        if not port or port == "No ports found":
+        port_string = self.port_combo.currentText()
+        if not port_string or port_string == "No ports found":
             QMessageBox.warning(self, "Error", "Please select a valid port")
             return
         
+        # Extract device name (handles "COM3" and "COM3 - Description" formats)
+        port = AcuitySensorClient.get_port_device(port_string)
+        
         # Create temporary client for single measurement
-        client = AcuitySensorClient(port=port, sensor_id=0)
+        # Use higher timeout for far-distance measurements
+        client = AcuitySensorClient(port=port, sensor_id=0, timeout=3.0)
         
         try:
             if not client.connect():
@@ -300,7 +340,11 @@ class MainWindow(QMainWindow):
                         
                         # Add to table
                         self._on_sample_acquired(sample)
-                        self._log(f"Single measurement: {converted_value:.4g} {unit.value}")
+                        
+                        # Format with selected decimal places
+                        decimal_places = self.decimal_spinbox.value()
+                        formatted_value = f"{converted_value:.{decimal_places}f}"
+                        self._log(f"Single measurement: {formatted_value} {unit.value}")
                     else:
                         QMessageBox.warning(self, "Parse Error", "Could not parse sensor response")
             else:
@@ -313,27 +357,37 @@ class MainWindow(QMainWindow):
     def _on_connect_clicked(self) -> None:
         """Handle connect button click."""
         if self.connect_btn.text() == "Connect":
-            port = self.port_combo.currentText()
-            if not port or port == "No ports found":
+            port_string = self.port_combo.currentText()
+            if not port_string or port_string == "No ports found":
                 QMessageBox.warning(self, "Error", "Please select a valid port")
                 return
             
-            # Try to connect
+            # Extract device name (handles "COM3" and "COM3 - Description" formats)
+            port = AcuitySensorClient.get_port_device(port_string)
+            
+            # Try to connect with higher timeout for far-distance measurements
             client = AcuitySensorClient(
                 port=port,
                 sensor_id=0,
+                timeout=3.0,
             )
             
             if client.connect():
-                # Get sensor info
-                sn = client.read_serial_number()
+                # connect() already verified the sensor responds (serial number check).
+                # Read firmware separately to show in log.
                 fw = client.read_firmware_version()
-                client.disconnect()
+                
+                # Store connected client for laser control
+                self.connected_client = client
                 
                 self.status_label.setText(f"Connected ({port})")
                 self.status_label.setStyleSheet("color: green; font-weight: bold;")
                 self.connect_btn.setText("Disconnect")
+                self.laser_on_btn.setEnabled(True)
+                self.laser_off_btn.setEnabled(True)
                 
+                # Parse and display serial number from connection verification
+                sn = client.read_serial_number()
                 info = f"Connected to {port}\n"
                 if sn:
                     info += f"Serial: {sn}\n"
@@ -341,12 +395,27 @@ class MainWindow(QMainWindow):
                     info += f"Firmware: {fw}\n"
                 self._log(info)
             else:
-                QMessageBox.critical(self, "Error", f"Failed to connect to {port}")
+                QMessageBox.critical(
+                    self,
+                    "Connection Failed",
+                    f"Could not connect to sensor on {port}.\n\n"
+                    "Please check:\n"
+                    "  \u2022 The sensor is powered on\n"
+                    "  \u2022 The USB cable is connected\n"
+                    "  \u2022 The correct COM port is selected"
+                )
         else:
             # Disconnect
+            if self.connected_client:
+                self.connected_client.disconnect()
+                self.connected_client = None
+            
             self.status_label.setText("Disconnected")
             self.status_label.setStyleSheet("color: red;")
             self.connect_btn.setText("Connect")
+            self.laser_on_btn.setEnabled(False)
+            self.laser_off_btn.setEnabled(False)
+            self.laser_distance_label.setText("Distance: -")
             self._log("Disconnected from sensor")
     
     @Slot()
@@ -361,15 +430,19 @@ class MainWindow(QMainWindow):
         if folder:
             self.output_folder = Path(folder)
             self.folder_label.setText(str(self.output_folder))
+            self._save_settings()
             self._log(f"Output folder set to: {self.output_folder}")
     
     @Slot()
     def _on_start_collection(self) -> None:
         """Handle start collection button click."""
-        port = self.port_combo.currentText()
-        if not port or port == "No ports found":
+        port_string = self.port_combo.currentText()
+        if not port_string or port_string == "No ports found":
             QMessageBox.warning(self, "Error", "Please select a valid port")
             return
+        
+        # Extract device name (handles "COM3" and "COM3 - Description" formats)
+        port = AcuitySensorClient.get_port_device(port_string)
         
         if not self.output_folder.exists():
             self.output_folder.mkdir(parents=True, exist_ok=True)
@@ -389,9 +462,17 @@ class MainWindow(QMainWindow):
         self.sample_count = 0
         self.data_table.setRowCount(0)
         
+        # Disconnect laser control to free up serial port for worker
+        # We'll reconnect after collection stops
+        laser_was_connected = False
+        if self.connected_client and self.connected_client.is_connected():
+            laser_was_connected = True
+            self.connected_client.disconnect()
+        
         # Create CSV exporter if enabled
         if self.export_csv_checkbox.isChecked():
-            self.csv_exporter = CSVExporter(str(self.output_folder))
+            decimal_places = self.decimal_spinbox.value()
+            self.csv_exporter = CSVExporter(str(self.output_folder), decimal_places=decimal_places)
             self.csv_exporter.open()
         else:
             self.csv_exporter = None
@@ -403,6 +484,9 @@ class MainWindow(QMainWindow):
         self.worker.measurement_stopped.connect(self._on_measurement_stopped)
         self.worker.error_occurred.connect(self._on_error_occurred)
         
+        # Store whether laser was connected so we can reconnect after
+        self.laser_was_connected_before_collection = laser_was_connected
+        
         self.worker.start()
         
         self.start_btn.setEnabled(False)
@@ -410,6 +494,8 @@ class MainWindow(QMainWindow):
         self.port_combo.setEnabled(False)
         self.mode_combo.setEnabled(False)
         self.freq_combo.setEnabled(False)
+        self.laser_on_btn.setEnabled(False)
+        self.laser_off_btn.setEnabled(False)
         
         self._log("Collection started")
     
@@ -428,12 +514,83 @@ class MainWindow(QMainWindow):
         self.mode_combo.setEnabled(True)
         self.freq_combo.setEnabled(True)
         
+        # Reconnect laser control if it was connected before collection
+        if hasattr(self, 'laser_was_connected_before_collection') and self.laser_was_connected_before_collection:
+            port_string = self.port_combo.currentText()
+            if port_string and port_string != "No ports found":
+                port = AcuitySensorClient.get_port_device(port_string)
+                import time
+                time.sleep(0.5)  # Small delay to let port settle
+                try:
+                    self.connected_client = AcuitySensorClient(port=port, sensor_id=0, timeout=3.0)
+                    if self.connected_client.connect():
+                        self.laser_on_btn.setEnabled(True)
+                        self.laser_off_btn.setEnabled(True)
+                        self._log("Laser control reconnected")
+                    else:
+                        self._log("Warning: Could not reconnect laser control")
+                        self.connected_client = None
+                except Exception as e:
+                    self._log(f"Error reconnecting laser: {str(e)}")
+                    self.connected_client = None
+            self.laser_was_connected_before_collection = False
+        self.freq_combo.setEnabled(True)
+        
         self._log("Collection stopped")
+    
+    @Slot()
+    def _on_laser_on(self) -> None:
+        """Handle laser on button click."""
+        if not self.connected_client or not self.connected_client.is_connected():
+            QMessageBox.warning(self, "Error", "Please connect to the sensor first")
+            return
+
+        try:
+            response = self.connected_client.laser_on()
+            if response:
+                # Try to parse the distance from the response
+                from app.sensor.parsing import parse_distance_response
+                distance = parse_distance_response(response)
+                if distance is not None:
+                    unit = self.unit_combo.currentData()
+                    from app.domain.conversion import convert_0p1mm_to_unit
+                    converted = convert_0p1mm_to_unit(distance, unit)
+                    decimal_places = self.decimal_spinbox.value()
+                    formatted = f"{converted:.{decimal_places}f}"
+                    self.laser_distance_label.setText(f"Distance: {formatted} {unit.value}")
+                    self._log(f"✓ Laser ON - Distance: {formatted} {unit.value}")
+                else:
+                    self.laser_distance_label.setText("Distance: (no measurement)")
+                    self._log(f"✓ Laser ON (Response: {response})")
+            else:
+                QMessageBox.warning(self, "Error", "No response from laser")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Laser ON failed: {str(e)}")
+    
+    @Slot()
+    def _on_laser_off(self) -> None:
+        """Handle laser off button click."""
+        if not self.connected_client or not self.connected_client.is_connected():
+            QMessageBox.warning(self, "Error", "Please connect to the sensor first")
+            return
+
+        try:
+            response = self.connected_client.laser_off()
+            if response is not None:
+                self.laser_distance_label.setText("Distance: -")
+                self._log(f"✓ Laser OFF")
+            else:
+                QMessageBox.warning(self, "Error", "No response from laser OFF")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Laser OFF failed: {str(e)}")
     
     @Slot(object)
     def _on_sample_acquired(self, sample) -> None:
         """Handle new sample acquired."""
         self.sample_count += 1
+        
+        # Get decimal places setting
+        decimal_places = self.decimal_spinbox.value()
         
         # Add to table
         row = self.data_table.rowCount()
@@ -441,7 +598,9 @@ class MainWindow(QMainWindow):
         
         self.data_table.setItem(row, 0, QTableWidgetItem(sample.timestamp_iso[:19]))
         self.data_table.setItem(row, 1, QTableWidgetItem(str(sample.raw_0p1mm)))
-        self.data_table.setItem(row, 2, QTableWidgetItem(f"{sample.value:.4g}"))
+        # Format with selected decimal places
+        formatted_value = f"{sample.value:.{decimal_places}f}"
+        self.data_table.setItem(row, 2, QTableWidgetItem(formatted_value))
         self.data_table.setItem(row, 3, QTableWidgetItem(sample.unit))
         self.data_table.setItem(row, 4, QTableWidgetItem(sample.mode))
         self.data_table.setItem(row, 5, QTableWidgetItem(
@@ -476,20 +635,98 @@ class MainWindow(QMainWindow):
         self._on_stop_collection()
     
     @Slot()
-    def _on_open_csv(self) -> None:
-        """Open CSV file in default application."""
-        if self.csv_exporter:
-            filepath = self.csv_exporter.get_filepath()
-            if filepath.exists():
-                import subprocess
-                import platform
-                
-                if platform.system() == "Windows":
-                    subprocess.Popen(f"start {filepath}", shell=True)
-                elif platform.system() == "Darwin":
-                    subprocess.Popen(["open", str(filepath)])
-                else:
-                    subprocess.Popen(["xdg-open", str(filepath)])
+    def _on_open_output_folder(self) -> None:
+        """Open the currently selected output folder."""
+        try:
+            self.output_folder.mkdir(parents=True, exist_ok=True)
+
+            import subprocess
+            import platform
+
+            if platform.system() == "Windows":
+                import os
+                os.startfile(str(self.output_folder))
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(self.output_folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.output_folder)])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open folder: {str(e)}")
+
+    def _load_settings(self) -> None:
+        """Load persisted user settings into the UI."""
+        output_folder = self.settings.value("output_folder", str(self.output_folder), type=str)
+        self.output_folder = Path(output_folder)
+        self.folder_label.setText(str(self.output_folder))
+
+        export_csv = self.settings.value("export_csv", True, type=bool)
+        self.export_csv_checkbox.setChecked(export_csv)
+
+        decimal_places = self.settings.value("decimal_places", 4, type=int)
+        self.decimal_spinbox.setValue(decimal_places)
+
+        saved_mode = self.settings.value("mode", MeasurementMode.CONTINUOUS.value, type=str)
+        for i in range(self.mode_combo.count()):
+            mode = self.mode_combo.itemData(i)
+            if mode and mode.value == saved_mode:
+                self.mode_combo.setCurrentIndex(i)
+                break
+
+        saved_freq = self.settings.value("frequency_hz", 10.0, type=float)
+        for i in range(self.freq_combo.count()):
+            freq = self.freq_combo.itemData(i)
+            if freq == saved_freq:
+                self.freq_combo.setCurrentIndex(i)
+                break
+
+        saved_unit = self.settings.value("unit", Unit.MM.value, type=str)
+        for i in range(self.unit_combo.count()):
+            unit = self.unit_combo.itemData(i)
+            if unit and unit.value == saved_unit:
+                self.unit_combo.setCurrentIndex(i)
+                break
+
+        saved_port = self.settings.value("port", "", type=str)
+        if saved_port:
+            idx = self.port_combo.findText(saved_port)
+            if idx >= 0:
+                self.port_combo.setCurrentIndex(idx)
+
+        self.port_combo.currentIndexChanged.connect(self._save_settings)
+        self.mode_combo.currentIndexChanged.connect(self._save_settings)
+        self.freq_combo.currentIndexChanged.connect(self._save_settings)
+        self.unit_combo.currentIndexChanged.connect(self._save_settings)
+        self.decimal_spinbox.valueChanged.connect(self._save_settings)
+        self.export_csv_checkbox.toggled.connect(self._save_settings)
+
+    def _save_settings(self, *args) -> None:
+        """Persist current user settings."""
+        self.settings.setValue("output_folder", str(self.output_folder))
+        self.settings.setValue("export_csv", self.export_csv_checkbox.isChecked())
+        self.settings.setValue("decimal_places", self.decimal_spinbox.value())
+
+        mode = self.mode_combo.currentData()
+        if mode is not None:
+            self.settings.setValue("mode", mode.value)
+
+        unit = self.unit_combo.currentData()
+        if unit is not None:
+            self.settings.setValue("unit", unit.value)
+
+        freq = self.freq_combo.currentData()
+        if freq is not None:
+            self.settings.setValue("frequency_hz", float(freq))
+
+        port_text = self.port_combo.currentText()
+        if port_text and port_text != "No ports found":
+            self.settings.setValue("port", port_text)
+
+        self.settings.sync()
+
+    def closeEvent(self, event) -> None:
+        """Persist settings when the window closes."""
+        self._save_settings()
+        super().closeEvent(event)
     
     def _log(self, message: str) -> None:
         """Add message to log."""

@@ -52,6 +52,39 @@ class TestCSVExporter(unittest.TestCase):
             self.assertIn("mode", lines[0])
             self.assertIn("2026-03-03T12:00:00", lines[1])
 
+    def test_decimal_places_formatting(self):
+        """Test decimal places formatting in CSV output."""
+        sample = SampleRecord(
+            timestamp_iso="2026-03-03T12:00:00",
+            epoch_ms=1740991200000,
+            raw_0p1mm=12345,
+            value=1234.56789,
+            unit="millimeters",
+            mode="continuous",
+            interval_hz=10.0,
+            sensor_id=0,
+            response="g0h+00012345",
+        )
+        
+        # Test with 2 decimal places
+        with CSVExporter(self.output_folder, "test_2dp", decimal_places=2) as exporter:
+            exporter.write_sample(sample)
+            filepath = exporter.get_filepath()
+        
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+            self.assertIn("1234.57", lines[1])  # Rounded to 2 decimal places
+        
+        # Test with 6 decimal places
+        with CSVExporter(self.output_folder, "test_6dp", decimal_places=6) as exporter:
+            exporter.write_sample(sample)
+            filepath = exporter.get_filepath()
+        
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+            self.assertIn("1234.567890", lines[1])  # Formatted to 6 decimal places
+
 
 if __name__ == "__main__":
     unittest.main()
+

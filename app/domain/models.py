@@ -53,7 +53,7 @@ class CollectionConfig:
     unit: Unit  # Output unit conversion
     output_folder: str  # Path to save CSV
     baudrate: int = 19200
-    timeout: float = 2.0
+    timeout: float = 3.0
 
 
 @dataclass

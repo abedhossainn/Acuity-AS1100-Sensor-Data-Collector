@@ -20,7 +20,7 @@ class CSVExporter:
         "frequency_hz",
     ]
     
-    def __init__(self, output_folder: str, session_name: Optional[str] = None):
+    def __init__(self, output_folder: str, session_name: Optional[str] = None, decimal_places: int = 4):
         """
         Initialize exporter.
         
@@ -30,9 +30,12 @@ class CSVExporter:
             Path where CSV files will be saved
         session_name : str, optional
             Custom session name; defaults to timestamp
+        decimal_places : int, optional
+            Number of decimal places for values (default 4)
         """
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(parents=True, exist_ok=True)
+        self.decimal_places = max(1, min(10, decimal_places))  # Clamp between 1-10
         
         if session_name is None:
             session_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -68,9 +71,12 @@ class CSVExporter:
         if not self._writer:
             raise RuntimeError("CSV file not open. Call open() first.")
         
+        # Format value with configured decimal places
+        formatted_distance = f"{sample.value:.{self.decimal_places}f}"
+        
         row = {
             "timestamp": sample.timestamp_iso,
-            "distance": f"{sample.value:.4g}",
+            "distance": formatted_distance,
             "unit": sample.unit,
             "mode": sample.mode,
             "frequency_hz": sample.interval_hz if sample.interval_hz else "",

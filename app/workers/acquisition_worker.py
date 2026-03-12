@@ -6,7 +6,7 @@ import time
 
 from PySide6.QtCore import QThread, Signal
 
-from app.domain.models import SampleRecord, MeasurementMode, IntervalMode
+from app.domain.models import SampleRecord, MeasurementMode
 from app.sensor.serial_client import AcuitySensorClient
 from app.sensor.parsing import parse_distance_response, is_error_response
 from app.domain.conversion import convert_0p1mm_to_unit
@@ -73,60 +73,98 @@ class AcquisitionWorker(QThread):
             self._is_running = False
     
     def _run_continuous(self) -> None:
-        """Run continuous measurement mode."""
+        """
+        Run continuous measurement mode using s0h sensor streaming with
+        strict host-clock phase-locked decimation.
+
+        Instead of polling with s0g (which has a full command round-trip
+        cost every sample and can never exceed the sensor's single-shot
+        latency), we:
+
+          1. Send s0h to start the sensor's continuous streaming mode.  In
+             this mode the sensor pushes distance lines as fast as it can
+             measure, with no per-sample command overhead.
+
+          2. Run a tight loop that reads any available bytes from the serial
+             buffer immediately (non-blocking) and keeps the *latest valid
+             measurement* in memory.
+
+          3. Use a perf_counter phase-locked timer to emit one sample at
+             exactly the user-requested interval.  The emitted value is always
+             the most-recent measurement received before that tick.
+
+        This decouples emission rate (host clock — always exact) from sensor
+        measurement rate (physics limited).  For a slow or far target the
+        user still receives samples at exactly the requested Hz; each sample
+        simply reflects the latest available reading at that moment.
+        """
+        self._is_running = True
+        interval = (
+            1.0 / self.config.interval_hz
+            if self.config.interval_hz and self.config.interval_hz > 0
+            else 0.1
+        )
+
+        # Start sensor continuous streaming (s0h)
+        self.client.clear_input_buffer()
+        if not self.client.send_command(self.client._cmd("h")):
+            self.error_occurred.emit("Failed to start continuous tracking")
+            return
+        # Consume the ACK line (g0?) before reading measurement data
+        self.client.read_response(wait_time=1.0)
+
+        self.measurement_started.emit(
+            f"Collection started at {self.config.interval_hz} Hz "
+            f"({interval * 1000:.0f} ms interval)"
+        )
+
+        latest_raw: Optional[int] = None
+        latest_response: Optional[str] = None
+        line_buf = ""
+        next_emit = time.perf_counter() + interval
+
         try:
-            self._is_running = True
-            
-            # Always use basic continuous mode (s#h)
-            # Throttling will be done on client side if needed
-            response = self.client.start_continuous_tracking()
-            
-            # Check if startup was successful
-            if not response:
-                self.error_occurred.emit("No response from sensor when starting measurement")
-                return
-            
-            if is_error_response(response):
-                self.error_occurred.emit(f"Sensor error when starting measurement: {response}")
-                return
-            
-            self.measurement_started.emit(f"Continuous tracking started: {response}")
-            
-            # Acquisition loop with optional client-side throttling
-            next_sample_time = time.time()
-            
             while self._is_running and not self._should_stop:
-                response = self.client.read_available_data(wait_time=0.05)
-                
-                if response:
-                    # Skip error responses
-                    if is_error_response(response):
-                        continue
-                    
-                    # Parse and emit sample
-                    raw_value = parse_distance_response(response)
-                    if raw_value is not None:
-                        # Apply client-side throttling if in host-throttled mode
-                        if self.config.interval_mode == IntervalMode.HOST_THROTTLED:
-                            now = time.time()
-                            if self.config.interval_hz > 0:
-                                min_interval = 1.0 / self.config.interval_hz
-                                if now < next_sample_time:
-                                    continue
-                                next_sample_time = now + min_interval
-                        
-                        # Create sample record
-                        sample = self._create_sample_record(raw_value, response)
+                # ── 1. Drain the serial receive buffer (non-blocking) ──
+                chunk = self.client.read_stream_chunk()
+                if chunk:
+                    line_buf += chunk
+                    # Parse all complete CRLF-terminated lines in the buffer
+                    while "\n" in line_buf:
+                        line, line_buf = line_buf.split("\n", 1)
+                        line = line.strip()
+                        if line and not is_error_response(line):
+                            raw = parse_distance_response(line)
+                            if raw is not None:
+                                latest_raw = raw
+                                latest_response = line
+
+                # ── 2. Emit on the host-clock tick ──
+                now = time.perf_counter()
+                if now >= next_emit:
+                    if latest_raw is not None:
+                        sample = self._create_sample_record(
+                            latest_raw, latest_response
+                        )
                         self.sample_acquired.emit(sample)
-                
-                if self._should_stop:
-                    break
-                
-                time.sleep(0.01)
-        
+
+                    # Advance phase by one interval (not now+interval) so
+                    # timing never drifts even if the loop is occasionally slow.
+                    next_emit += interval
+                    # Safety: if we've fallen >2 intervals behind, re-anchor.
+                    if time.perf_counter() > next_emit + interval:
+                        next_emit = time.perf_counter() + interval
+
+                # ── 3. Sleep 1 ms — much shorter than any target interval ──
+                # This keeps CPU free while still reacting within 1-2 ms of
+                # the emission tick.  Even 10 Hz (100 ms interval) has 100×
+                # headroom over this sleep.
+                time.sleep(0.001)
+
         finally:
+            # Stop the sensor stream before the port is released
             self.client.stop_measurement()
-            self.measurement_stopped.emit("Continuous tracking stopped")
+            self.measurement_stopped.emit("Collection stopped")
     
     def _run_single(self) -> None:
         """Run single measurement mode (one measurement per start)."""
