@@ -119,5 +119,3 @@ Then rebuild and start fresh:
 ## Notes
 
 - For local development, use the root `docker-compose.yml` and root `start_agent_session.ps1`.
-
-- `field_deployment/` contains packaging/deployment assets and is separate from the root local dev workflow.
