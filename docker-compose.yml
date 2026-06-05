@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: as1100_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SENSOR_PROVIDER=agent
+      - AGENT_BASE_URL=http://host.docker.internal:8010
+      - AS1100_PERSISTENCE_MODE=dual
+      - AS1100_DURABLE_WRITES=1
+      - AS1100_FSYNC_INTERVAL_ROWS=1
+      - AS1100_SQLITE_COMMIT_INTERVAL_ROWS=1
+    volumes:
+      - sensor_data:/data
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: as1100_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    restart: unless-stopped
+
+volumes:
+  sensor_data:
+    driver: local

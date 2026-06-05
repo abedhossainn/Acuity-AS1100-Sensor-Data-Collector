@@ -1,1 +1,0 @@
-"""Sensor integration layer."""
